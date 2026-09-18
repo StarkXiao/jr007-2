@@ -49,6 +49,7 @@ async function goNotifications() {
         </template>
         <template v-if="auth.isModerator">
           <RouterLink to="/review">审核台</RouterLink>
+          <RouterLink to="/privacy">隐私复核</RouterLink>
           <RouterLink to="/reports">举报处置</RouterLink>
         </template>
         <template v-if="auth.isAdmin">

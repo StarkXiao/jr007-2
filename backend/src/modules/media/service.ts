@@ -19,7 +19,7 @@ import { logger } from "../../utils/logger";
 import { isModerator } from "../../types/auth";
 import type { AuthUser } from "../../types/auth";
 import { IMAGE_VARIANT_NAMES } from "../shared/serialize";
-import type { PrivacyStatus } from "@prisma/client";
+import { Prisma, PrivacyStatus, type RegionReviewStatus } from "@prisma/client";
 
 export const PUBLISHABLE: PrivacyStatus[] = [...PUBLISHABLE_PRIVACY_STATUSES];
 
@@ -127,18 +127,26 @@ function buildVariantMap(uuid: string, version: number): Record<string, string> 
 export interface ProcessOutcome {
   privacyStatus: PrivacyStatus;
   autoDetected: number;
+  /** 置信度分级统计：trusted 自动放行 / ambiguous 待人工 / candidate 仅候选 */
+  grades: { trusted: number; ambiguous: number; candidate: number };
   notes: string[];
 }
+
+/** 走隐私检测（含置信度自动分级）的处理原因 */
+const DETECTION_REASONS = new Set(["upload", "retry", "redetect"]);
+
+/** 人工已经做过判定的自动区域：已采纳 / 已驳回，批量重跑不得覆盖 */
+const ADJUDICATED_REVIEW: RegionReviewStatus[] = ["accepted", "dismissed"];
 
 /**
  * 图片处理流水线（worker 与同步降级路径共用）。
  *
- * 顺序不可调换：读原图 → 检测 → 落模糊区域 → 渲染变体 → 更新状态。
+ * 顺序：读原图 → 检测（在干净的清洗图上）→ 分级落框 → 一次性渲染变体 → 更新状态。
  * 每一步都从**原图**重新渲染，避免重复编辑导致模糊区域叠加失真。
  */
 export async function processAsset(
   assetUuid: string,
-  reason: "upload" | "blur-update" | "retry" | "privacy-reset",
+  reason: "upload" | "blur-update" | "retry" | "redetect" | "privacy-reset",
 ): Promise<ProcessOutcome> {
   const asset = await prisma.mediaAsset.findUnique({ where: { uuid: assetUuid } });
   if (!asset) throw AppError.notFound("图片不存在");
@@ -148,28 +156,76 @@ export async function processAsset(
   const original = await storage.getPrivate(key);
 
   const existingRegions = await prisma.blurRegion.findMany({ where: { assetId: asset.id } });
-  const activeRegions = existingRegions.filter((region) => !region.ignored);
-
-  const result = await processImage(original, activeRegions.map(toBlurInput));
-  await writeVariants(assetUuid, asset.variantVersion + 1, result.variants);
 
   let privacyStatus: PrivacyStatus;
   let autoDetected = 0;
-  const notes: string[] = [];
+  let notes: string[] = [];
+  const grades = { trusted: 0, ambiguous: 0, candidate: 0 };
+  /** 低置信度候选框：不打码，只随检测元数据留存供人工抽查 */
+  let candidateBoxes: unknown[] = [];
+  /** 检测分支的完整结果，末尾统一写元数据 */
+  let detectionResult: import("../../services/detection").DetectionResult | null = null;
+  let appliedRegions = existingRegions.filter((region) => !region.ignored);
 
-  if (reason === "upload" || reason === "retry") {
-    const detection = await detectSensitiveRegions(result.variants.full.buffer);
-    notes.push(...detection.notes);
+  if (DETECTION_REASONS.has(reason)) {
+    // 先在原图上做一次清洗（去 EXIF + 方向摆正），检测跑在干净的全分辨率图上，
+    // 不能用已打码的变体，否则检测器看到的人脸已经糊了
+    const clean = await sanitizeForDetection(original);
 
-    if (detection.boxes.length > 0) {
-      // 重复处理同一张图（例如入队后又走了同步降级）时，
-      // 先把上一次自动生成的区域清掉，否则会不断叠加出重复的打码块。
-      await prisma.blurRegion.deleteMany({
-        where: { assetId: asset.id, source: "auto" },
-      });
+    // 重跑/重试都属于"重新检测"：人工既判区域受保护——手动框 +
+    // 已被复核接受/驳回的自动框。只有首次上传（无历史框）才全量替换。
+    const isReprocessing = reason === "redetect" || reason === "retry";
 
+    const protectedRegions = isReprocessing
+      ? existingRegions
+          .filter(
+            (region) =>
+              region.source === "manual" ||
+              (region.source === "auto" &&
+                region.reviewStatus !== null &&
+                ADJUDICATED_REVIEW.includes(region.reviewStatus)),
+          )
+          .map((region) => ({ x: region.x, y: region.y, w: region.w, h: region.h }))
+      : [];
+
+    const detection = await detectSensitiveRegions(
+      { buffer: clean.buffer, mimetype: "image/webp", width: clean.width, height: clean.height },
+      { protectedRegions },
+    );
+    detectionResult = detection;
+    notes = detection.notes;
+    grades.trusted = detection.graded.trusted.length;
+    grades.ambiguous = detection.graded.ambiguous.length;
+    grades.candidate = detection.graded.candidate.length;
+    candidateBoxes = detection.graded.candidate.map((box) => ({
+      x: box.x,
+      y: box.y,
+      w: box.w,
+      h: box.h,
+      label: box.label,
+      confidence: box.confidence,
+      detector: originOf(box, detection.adapterOutcomes),
+    }));
+
+    // 只删除"机器尚未被人工裁定"的自动框；
+    // accepted/dismissed 是人工结论，重检也不能冲掉
+    await prisma.blurRegion.deleteMany({
+      where: {
+        assetId: asset.id,
+        source: "auto",
+        ...(isReprocessing ? { reviewStatus: { in: ["trusted", "pending"] } } : {}),
+      },
+    });
+
+    // trusted 与 ambiguous 落为打码区域；candidate 不打码，只进检测元数据
+    const autoRows = [
+      ...detection.graded.trusted.map((box) => ({ box, reviewStatus: "trusted" as const })),
+      ...detection.graded.ambiguous.map((box) => ({ box, reviewStatus: "pending" as const })),
+    ];
+
+    if (autoRows.length > 0) {
       await prisma.blurRegion.createMany({
-        data: detection.boxes.map((box) => ({
+        data: autoRows.map(({ box, reviewStatus }) => ({
           assetId: asset.id,
           source: "auto" as const,
           algorithm: "pixelate" as const,
@@ -179,28 +235,75 @@ export async function processAsset(
           h: box.h,
           label: box.label,
           confidence: box.confidence,
+          detector: originOf(box, detection.adapterOutcomes),
+          reviewStatus,
+          // 高置信度框视为机器已复核
+          reviewedAt: reviewStatus === "trusted" ? new Date() : null,
           strength: 14,
         })),
       });
-      autoDetected = detection.boxes.length;
+      autoDetected = autoRows.length;
+    }
 
-      // 自动检测到区域后需要按新区域重新渲染一次，确保公开版本确实被模糊
-      const regions = await prisma.blurRegion.findMany({
-        where: { assetId: asset.id, ignored: false },
-      });
-      const rendered = await processImage(original, regions.map(toBlurInput));
-      await writeVariants(assetUuid, asset.variantVersion + 2, rendered.variants);
-      privacyStatus = "auto_blurred";
-    } else if (detection.anyAvailable) {
-      // 检测器可用且未发现敏感区域，才算真正干净
-      privacyStatus = "auto_clean";
-    } else {
+    const allRegions = await prisma.blurRegion.findMany({
+      where: { assetId: asset.id, ignored: false },
+    });
+    appliedRegions = allRegions;
+
+    if (!detection.anyAvailable) {
       // 没有检测能力时必须人工确认，这是不可跳过的门禁
       privacyStatus = "needs_manual";
+    } else if (detection.decision === "clean") {
+      // 检测器可用且未发现敏感区域，才算真正干净
+      privacyStatus = "auto_clean";
+    } else if (detection.decision === "auto_confirmed") {
+      // 全部命中都是高置信度：自动模糊并直接放行，不占用人工复核
+      privacyStatus = "auto_confirmed";
+    } else {
+      // 有中置信度框（默认先模糊）或低置信度候选（未打码）——都只让人工看这些疑难
+      privacyStatus = "auto_blurred";
     }
   } else {
-    const manualCount = existingRegions.filter((region) => region.source === "manual").length;
-    privacyStatus = manualCount > 0 ? "manual_blurred" : "auto_blurred";
+    if (reason === "blur-update") {
+      const manualCount = existingRegions.filter((region) => region.source === "manual").length;
+      // 驳回重渲染时若已经是 confirmed（逐条复核场景），保持已确认状态
+      privacyStatus = asset.privacyStatus === "confirmed"
+        ? "confirmed"
+        : manualCount > 0
+          ? "manual_blurred"
+          : "auto_blurred";
+    } else {
+      // privacy-reset（隐私举报成立后的重置）：必须人工处理
+      privacyStatus = "needs_manual";
+    }
+  }
+
+  // 统一在最后从原图渲染一次：检测分支拿到的是新落的分级框，
+  // 编辑分支拿到的是审核员保存后的区域，避免旧实现里"检测后再渲染第二次"的双版本号
+  const rendered = await processImage(original, appliedRegions.map(toBlurInput));
+  await writeVariants(assetUuid, asset.variantVersion + 1, rendered.variants);
+
+  // blur-update 只是人工调整区域，上一轮检测的分级 / 候选 / 适配器信息必须保留
+  // （复核自动升级依赖 grades.candidate）；只刷新渲染时间戳。
+  let detectionMeta: Prisma.InputJsonValue;
+  if (detectionResult) {
+    detectionMeta = toJsonValue({
+      notes,
+      autoDetected,
+      grades,
+      candidates: candidateBoxes,
+      adapters: detectionResult.adapterOutcomes.map((outcome) => ({
+        id: outcome.adapter,
+        available: outcome.available,
+        found: outcome.boxes.length,
+        reason: outcome.reason ?? null,
+      })),
+      thresholds: detectionResult.thresholds,
+      processedAt: new Date().toISOString(),
+    });
+  } else {
+    const previous = (asset.detectionMeta ?? {}) as Record<string, unknown>;
+    detectionMeta = toJsonValue({ ...previous, rerenderedAt: new Date().toISOString() });
   }
 
   await prisma.mediaAsset.update({
@@ -208,14 +311,35 @@ export async function processAsset(
     data: {
       privacyStatus,
       exifStripped: true,
-      detectionMeta: toJsonValue({ notes, autoDetected, processedAt: new Date().toISOString() }),
+      detectionMeta,
       retryCount: reason === "retry" ? { increment: 1 } : undefined,
-      width: result.width,
-      height: result.height,
+      width: rendered.width,
+      height: rendered.height,
+      // 重检/重试把曾经放行的图片降回待复核时，清掉旧确认人，避免"谁确认的"对不上当前状态
+      ...(DETECTION_REASONS.has(reason) && !isPublishableStatus(privacyStatus)
+        ? { privacyConfirmedBy: null, privacyConfirmedAt: null }
+        : {}),
     },
   });
 
-  return { privacyStatus, autoDetected, notes };
+  return { privacyStatus, autoDetected, grades, notes };
+}
+
+/** 清洗原图（去元数据、按方向摆正），检测器的输入 */
+async function sanitizeForDetection(original: Buffer): Promise<{ buffer: Buffer; width: number; height: number }> {
+  const { sanitizeImage } = await import("../../services/imaging");
+  return sanitizeImage(original);
+}
+
+/** 反查某个框来自哪个适配器（框对象在 NMS / 分级中保持同一引用，按身份匹配） */
+function originOf(
+  box: object,
+  outcomes: Array<{ adapter: string; boxes: object[] }>,
+): string | null {
+  for (const outcome of outcomes) {
+    if (outcome.boxes.includes(box)) return outcome.adapter;
+  }
+  return null;
 }
 
 function toBlurInput(region: {
@@ -274,11 +398,15 @@ export interface BlurRegionPayload {
  * 覆盖式更新模糊区域。
  * 请求体描述的是"修改后的完整状态"，服务端据此增删改，
  * 避免前端需要维护复杂的差分逻辑。
+ *
+ * 审核员对自动框的去留会落成 reviewStatus（accepted / dismissed），
+ * 之后批量重跑检测时这些人工结论受保护，不会被机器结果冲掉。
  */
 export async function updateBlurRegions(
   assetUuid: string,
   regions: BlurRegionPayload[],
   reason: string | undefined,
+  actorId?: bigint,
 ): Promise<{ privacyStatus: PrivacyStatus; regionsApplied: number }> {
   const asset = await prisma.mediaAsset.findUnique({ where: { uuid: assetUuid } });
   if (!asset) throw AppError.notFound("图片不存在");
@@ -330,13 +458,32 @@ export async function updateBlurRegions(
   }
 
   await prisma.$transaction(async (tx) => {
-    // 删除本次未保留的区域
+    // 删除本次未保留的区域。
+    // 例外：已经过人工复核裁定（accepted/dismissed）的自动框不允许被"覆盖式保存"
+    // 静默删掉——复核台与模糊工作台是两个入口，工作台加载时看不到被驳回的框，
+    // 不保护就会让审核员在别处保存时把人工结论冲掉。要删除需显式传 id。
+    // 例外：已经过人工复核裁定（accepted/dismissed）的自动框不允许被"覆盖式保存"
+    // 静默删掉——复核台与模糊工作台是两个入口，工作台加载时看不到被驳回的框，
+    // 不保护就会让审核员在别处保存时把人工结论冲掉。要删除需显式传 id。
+    const notAdjudicated = {
+      OR: [
+        { source: "manual" as const },
+        { source: "auto" as const, reviewStatus: { in: ["trusted", "pending"] satisfies RegionReviewStatus[] } },
+        { source: "auto" as const, reviewStatus: null },
+      ],
+    };
     await tx.blurRegion.deleteMany({
-      where: { assetId: asset.id, id: keepIds.length > 0 ? { notIn: keepIds } : undefined },
+      where: {
+        assetId: asset.id,
+        ...notAdjudicated,
+        ...(keepIds.length > 0 ? { id: { notIn: keepIds } } : {}),
+      },
     });
 
     for (const region of regions) {
       if (region.id !== undefined) {
+        // 对自动检测框的复核结论：保留=accepted（含从忽略恢复），忽略=dismissed
+        const isAdjudication = region.source === "auto" && actorId !== undefined;
         await tx.blurRegion.update({
           where: { id: BigInt(region.id) },
           data: {
@@ -344,6 +491,13 @@ export async function updateBlurRegions(
             ignoreReason: region.ignoreReason ?? null,
             algorithm: region.algorithm ?? undefined,
             strength: region.strength ?? undefined,
+            ...(isAdjudication
+              ? {
+                  reviewStatus: (region.ignored ? "dismissed" : "accepted") as RegionReviewStatus,
+                  reviewedAt: new Date(),
+                  reviewedBy: actorId,
+                }
+              : {}),
           },
         });
         continue;
@@ -360,6 +514,7 @@ export async function updateBlurRegions(
           h: region.h ?? 0,
           strength: region.strength ?? 14,
           label: region.label ?? null,
+          createdBy: actorId ?? null,
         },
       });
     }
@@ -371,7 +526,7 @@ export async function updateBlurRegions(
   return { privacyStatus: outcome.privacyStatus, regionsApplied: regions.filter((r) => !r.ignored).length };
 }
 
-/** 审核员确认隐私处理完成——这是图片可发布的唯一出口之一 */
+/** 审核员确认隐私处理完成——这是图片可发布的出口之一（人工通道） */
 export async function confirmPrivacy(assetUuid: string, actorId: bigint): Promise<PrivacyStatus> {
   const asset = await prisma.mediaAsset.findUnique({ where: { uuid: assetUuid } });
   if (!asset) throw AppError.notFound("图片不存在");
@@ -383,12 +538,84 @@ export async function confirmPrivacy(assetUuid: string, actorId: bigint): Promis
     );
   }
 
+  // 兜底：确认时把所有尚未裁定的自动框标记为人工采纳，避免遗留 pending
+  await prisma.blurRegion.updateMany({
+    where: { assetId: asset.id, source: "auto", reviewStatus: "pending", ignored: false },
+    data: { reviewStatus: "accepted", reviewedAt: new Date(), reviewedBy: actorId },
+  });
+
   await prisma.mediaAsset.update({
     where: { id: asset.id },
     data: { privacyStatus: "confirmed", privacyConfirmedBy: actorId, privacyConfirmedAt: new Date() },
   });
 
   return "confirmed";
+}
+
+export interface RegionVerdict {
+  /** true=保留打码（accepted），false=确认无需打码（dismissed，必须给理由） */
+  accept: boolean;
+  reason?: string;
+}
+
+/**
+ * 复核单个疑难（中置信度）检测区域。
+ *
+ * 这是"只让人工复核疑难区域"的最小动作：审核员逐条对 pending 框下判断，
+ * 全部裁定完且没有遗留低置信度候选时，图片自动升级，无需再点整图确认。
+ */
+export async function reviewRegion(
+  assetUuid: string,
+  regionId: bigint,
+  verdict: RegionVerdict,
+  actorId: bigint,
+): Promise<{ privacyStatus: PrivacyStatus; remaining: number }> {
+  const asset = await prisma.mediaAsset.findUnique({ where: { uuid: assetUuid } });
+  if (!asset) throw AppError.notFound("图片不存在");
+
+  const region = await prisma.blurRegion.findUnique({ where: { id: regionId } });
+  if (!region || region.assetId !== asset.id) throw AppError.notFound("检测区域不存在");
+  if (region.source !== "auto") throw AppError.badRequest("手动区域不需要复核");
+  if (!verdict.accept && !verdict.reason?.trim()) {
+    throw AppError.badRequest("驳回检测区域时必须填写理由");
+  }
+
+  await prisma.blurRegion.update({
+    where: { id: regionId },
+    data: {
+      reviewStatus: verdict.accept ? "accepted" : "dismissed",
+      ignored: !verdict.accept,
+      ignoreReason: verdict.accept ? null : verdict.reason!.trim(),
+      reviewedAt: new Date(),
+      reviewedBy: actorId,
+    },
+  });
+
+  // 驳回意味着要去掉这块打码，必须从原图重新渲染公开变体
+  if (!verdict.accept) {
+    await processAsset(assetUuid, "blur-update");
+  }
+
+  const [remaining, fresh] = await Promise.all([
+    prisma.blurRegion.count({ where: { assetId: asset.id, reviewStatus: "pending" } }),
+    prisma.mediaAsset.findUniqueOrThrow({ where: { uuid: assetUuid } }),
+  ]);
+
+  // 所有疑难框裁定完毕，且没有遗留低置信度候选时才自动升级；
+  // needs_manual（检测器曾不可用）整张图没有检测背书，必须走整图确认。
+  let privacyStatus = fresh.privacyStatus;
+  if (remaining === 0 && fresh.privacyStatus === "auto_blurred") {
+    const meta = (fresh.detectionMeta ?? {}) as { grades?: { candidate?: number } };
+    if ((meta.grades?.candidate ?? 0) === 0) {
+      await prisma.mediaAsset.update({
+        where: { id: asset.id },
+        data: { privacyStatus: "confirmed", privacyConfirmedBy: actorId, privacyConfirmedAt: new Date() },
+      });
+      privacyStatus = "confirmed";
+    }
+  }
+
+  return { privacyStatus, remaining };
 }
 
 export async function retryProcessing(assetUuid: string): Promise<ProcessOutcome> {

@@ -74,8 +74,15 @@ export type NotificationType = keyof typeof NOTIFICATION_TYPES;
 /**
  * 允许发布到地图的隐私状态。
  * 全项目只有这一处定义，审核门禁、图片读取、前端提示都从这里取。
+ *
+ * - auto_clean：检测器可用且未发现任何敏感区域
+ * - auto_confirmed：敏感区域全部为高置信度命中，已自动模糊，无需人工介入
+ * - confirmed：经过人工确认（含模糊工作台保存 / 复核确认）
  */
-export const PUBLISHABLE_PRIVACY_STATUSES = ["auto_clean", "confirmed"] as const;
+export const PUBLISHABLE_PRIVACY_STATUSES = ["auto_clean", "auto_confirmed", "confirmed"] as const;
+
+/** 需要隐私人工复核的状态：模糊不放心或检测器不可用 */
+export const PRIVACY_REVIEW_STATUSES = ["needs_manual", "auto_blurred", "failed", "processing"] as const;
 
 export type PublishablePrivacyStatus = (typeof PUBLISHABLE_PRIVACY_STATUSES)[number];
 
@@ -100,6 +107,8 @@ export const AUDIT_ACTIONS = {
   REVIEW_APPEAL_DECIDE: "review.appeal.decide",
   MEDIA_BLUR_UPDATE: "media.blur.update",
   MEDIA_PRIVACY_CONFIRM: "media.privacy.confirm",
+  MEDIA_PRIVACY_REVIEW: "media.privacy.review",
+  MEDIA_REDETECT_BATCH: "media.redetect.batch",
   MEDIA_ORIGINAL_VIEW: "media.original.view",
   USER_BAN: "user.ban",
   USER_UNBAN: "user.unban",

@@ -30,8 +30,9 @@ const canAdd = computed(() => assets.value.length < limit.value);
 // 隐私状态直接展示给贡献者，让他知道图片还要过一道隐私处理
 const STATUS_TEXT: Record<string, string> = {
   processing: "隐私处理中…",
-  auto_clean: "未发现敏感区域，待审核确认",
-  auto_blurred: "已自动模糊，待审核确认",
+  auto_clean: "未发现敏感区域，自动通过",
+  auto_confirmed: "已自动模糊敏感区域，自动通过",
+  auto_blurred: "部分区域待人工复核",
   needs_manual: "需要人工确认隐私区域",
   manual_blurred: "已人工模糊，待确认",
   confirmed: "隐私处理已确认",

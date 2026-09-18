@@ -41,7 +41,7 @@ adminRouter.get(
       prisma.comment.count({ where: { status: "visible" } }),
       prisma.reviewTask.count({ where: { status: { in: ["pending", "in_review"] } } }),
       prisma.report.count({ where: { status: { in: ["open", "in_review"] } } }),
-      prisma.mediaAsset.count({ where: { privacyStatus: { in: ["needs_manual", "failed"] } } }),
+      prisma.mediaAsset.count({ where: { privacyStatus: { in: ["needs_manual", "auto_blurred", "failed"] } } }),
       prisma.spot.groupBy({
         by: ["categoryId"],
         where: { status: "published" },

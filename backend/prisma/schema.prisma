@@ -54,11 +54,24 @@ enum ReviewStatus {
 enum PrivacyStatus {
   processing
   auto_clean
+  auto_confirmed
   auto_blurred
   needs_manual
   manual_blurred
   confirmed
   failed
+}
+
+/** 自动检测区域的人工复核状态——置信度分级后只有 ambiguous 框进入人工队列 */
+enum RegionReviewStatus {
+  /** 高置信度（≥ autoConfirm 阈值），机器自动采纳，无需人工 */
+  trusted
+  /** 中置信度，默认先模糊，等待人工复核 */
+  pending
+  /** 人工复核后保留打码 */
+  accepted
+  /** 人工复核后判定无需打码（海报人脸、告示图案等） */
+  dismissed
 }
 
 enum CommentStatus {
@@ -110,6 +123,7 @@ model User {
   spotRevisions     SpotRevision[]
   mediaAssets       MediaAsset[]
   mediaConfirmed    MediaAsset[]       @relation("MediaPrivacyConfirmedBy")
+  blurRegionsReviewed BlurRegion[]     @relation("BlurRegionReviewedBy")
   comments          Comment[]
   confirmations     SpotConfirmation[]
   favorites         Favorite[]
@@ -301,6 +315,12 @@ model BlurRegion {
   strength     Int           @default(12) @db.SmallInt
   label        String?       @db.VarChar(32)
   confidence   Float?
+  /** 产出该框的检测适配器（face / plate / http / 插件名），人工框为 null */
+  detector     String?
+  /** 自动区域的复核分级；人工框为 null */
+  reviewStatus RegionReviewStatus? @map("review_status")
+  reviewedAt   DateTime?     @map("reviewed_at") @db.Timestamptz(6)
+  reviewedBy   BigInt?       @map("reviewed_by")
   ignored      Boolean       @default(false)
   ignoreReason String?       @map("ignore_reason")
   createdBy    BigInt?       @map("created_by")
@@ -308,8 +328,10 @@ model BlurRegion {
 
   asset   MediaAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
   creator User?      @relation(fields: [createdBy], references: [id])
+  reviewer User?     @relation("BlurRegionReviewedBy", fields: [reviewedBy], references: [id])
 
   @@index([assetId, ignored], map: "idx_blur_asset")
+  @@index([reviewStatus], map: "idx_blur_review_status")
   @@map("blur_regions")
 }
 

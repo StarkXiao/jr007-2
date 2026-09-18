@@ -130,10 +130,18 @@ export interface MediaStatus {
   width: number;
   height: number;
   variantVersion: number;
-  detectionMeta: { notes?: string[]; autoDetected?: number };
+  detectionMeta: {
+    notes?: string[];
+    autoDetected?: number;
+    grades?: { trusted: number; ambiguous: number; candidate: number };
+    candidates?: Array<{ x: number; y: number; w: number; h: number; label: string; confidence: number; detector: string | null }>;
+    adapters?: Array<{ id: string; available: boolean; found: number; reason: string | null }>;
+  };
   regions: BlurRegion[];
   variants: Record<string, string>;
 }
+
+export type RegionReviewStatus = "trusted" | "pending" | "accepted" | "dismissed";
 
 export interface BlurRegion {
   id?: number | string;
@@ -146,6 +154,9 @@ export interface BlurRegion {
   h?: number;
   label?: string | null;
   confidence?: number | null;
+  detector?: string | null;
+  reviewStatus?: RegionReviewStatus | null;
+  reviewedAt?: string | null;
   ignored?: boolean;
   ignoreReason?: string | null;
 }

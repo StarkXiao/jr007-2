@@ -38,9 +38,45 @@ watch(
 
 const activeRegions = computed(() => localRegions.value.filter((region) => !region.ignored));
 const autoRegions = computed(() => localRegions.value.filter((region) => region.source === "auto"));
+// 置信度分级后只有 pending（中置信度疑难框）需要人工逐条看
+const pendingRegions = computed(() =>
+  localRegions.value.filter((region) => region.source === "auto" && region.reviewStatus === "pending"),
+);
 const selected = computed(() =>
   selectedIndex.value === null ? null : (localRegions.value[selectedIndex.value] ?? null),
 );
+
+function gradeTagType(region: BlurRegion): "success" | "warning" | "info" | "danger" {
+  if (region.source === "manual") return "danger";
+  switch (region.reviewStatus) {
+    case "trusted":
+      return "success";
+    case "pending":
+      return "warning";
+    case "accepted":
+      return "success";
+    case "dismissed":
+      return "info";
+    default:
+      return "info";
+  }
+}
+
+function gradeLabel(region: BlurRegion): string {
+  if (region.source === "manual") return "手动框选";
+  switch (region.reviewStatus) {
+    case "trusted":
+      return "高置信度 · 已自动模糊";
+    case "pending":
+      return "待人工复核";
+    case "accepted":
+      return "复核已采纳";
+    case "dismissed":
+      return "复核已驳回";
+    default:
+      return "自动检测";
+  }
+}
 
 // 归一化坐标 → 百分比，容器缩放时区域会跟随图片一起变
 function styleOf(region: { x?: number; y?: number; w?: number; h?: number }) {
@@ -241,8 +277,10 @@ async function confirmPrivacy() {
         @click.stop="selectRegion(index)"
       >
         <span class="blur-region__label">
-          {{ region.label === "face" ? "人脸" : region.label === "plate" ? "车牌" : "手动" }}
+          {{ region.label === "face" ? "人脸" : region.label === "plate" ? "车牌" : region.label || "区域" }}
           <template v-if="region.confidence"> · {{ Math.round(region.confidence * 100) }}%</template>
+          <template v-if="region.source === 'auto'"> · {{ gradeLabel(region) }}</template>
+          <template v-else> · 手动</template>
           <template v-if="region.ignored"> · 已忽略</template>
         </span>
       </div>
@@ -262,17 +300,31 @@ async function confirmPrivacy() {
       <el-button size="small" type="danger" plain @click="removeSelected">删除这块</el-button>
     </div>
 
+    <el-alert
+      v-if="pendingRegions.length > 0"
+      type="warning"
+      :closable="false"
+      show-icon
+      :title="`有 ${pendingRegions.length} 块中置信度区域需要人工复核`"
+      description="高置信度区域已自动模糊并放行；只有下列机器拿不准的区域需要你逐条确认。"
+      style="margin-bottom: 10px"
+    />
+
     <div v-if="autoRegions.length" class="blur-editor__auto">
-      <p class="muted" style="margin: 0 0 6px">自动检测结果（逐条确认是否采纳）</p>
+      <p class="muted" style="margin: 0 0 6px">
+        自动检测结果（{{ pendingRegions.length }} 块待复核 / {{ autoRegions.length }} 块总计）
+      </p>
       <div v-for="(region, index) in localRegions" :key="`auto-${index}`">
         <div v-if="region.source === 'auto'" class="blur-editor__auto-row">
+          <el-tag :type="gradeTagType(region)" size="small">{{ gradeLabel(region) }}</el-tag>
           <el-checkbox
             :model-value="!region.ignored"
             @update:model-value="() => toggleIgnored(localRegions.indexOf(region))"
           >
-            {{ region.label === 'face' ? '人脸' : region.label === 'plate' ? '车牌' : '区域' }}
+            {{ region.label === 'face' ? '人脸' : region.label === 'plate' ? '车牌' : region.label || '区域' }}
             #{{ index + 1 }}
             <span v-if="region.confidence" class="muted">置信度 {{ Math.round(region.confidence * 100) }}%</span>
+            <span v-if="region.detector" class="muted">· {{ region.detector }}</span>
           </el-checkbox>
           <span v-if="region.ignoreReason" class="muted">忽略理由：{{ region.ignoreReason }}</span>
         </div>

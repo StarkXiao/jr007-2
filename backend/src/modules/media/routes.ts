@@ -19,10 +19,12 @@ import {
   confirmPrivacy,
   getVariant,
   retryProcessing,
+  reviewRegion,
   signedOriginalUrl,
   updateBlurRegions,
   uploadImage,
 } from "./service";
+import { enqueueRedetectBatch, privacyReviewStats } from "./redetect";
 
 export const mediaRouter = Router();
 export const moderationMediaRouter = Router();
@@ -98,7 +100,7 @@ mediaRouter.get(
         detectionMeta: true,
         blurRegions: {
           where: { ignored: false },
-          select: { id: true, source: true, algorithm: true, x: true, y: true, w: true, h: true, strength: true, label: true, confidence: true, ignored: true, ignoreReason: true },
+          select: { id: true, source: true, algorithm: true, x: true, y: true, w: true, h: true, strength: true, label: true, confidence: true, detector: true, reviewStatus: true, reviewedAt: true, ignored: true, ignoreReason: true },
         },
       },
     });
@@ -228,6 +230,7 @@ moderationMediaRouter.put(
       req.params.assetUuid,
       req.body.regions,
       req.body.reason,
+      req.user!.id,
     );
 
     await recordAudit({
@@ -286,3 +289,186 @@ moderationMediaRouter.post(
     res.json(ok(req, outcome));
   }),
 );
+
+// ── 置信度分级后的人工复核：队列、单框裁定、批量重跑 ──────────────────────────
+
+const PRIVACY_STATUSES = [
+  "processing",
+  "auto_clean",
+  "auto_confirmed",
+  "auto_blurred",
+  "needs_manual",
+  "manual_blurred",
+  "confirmed",
+  "failed",
+] as const;
+
+/**
+ * 隐私复核队列。
+ * 默认只返回**需要人工**的图片（待人工兜底 + 有中置信度疑难框），
+ * 高置信度自动放行的图片不出现在这里——这是"只让人工复核疑难区域"的接口落点。
+ */
+moderationMediaRouter.get(
+  "/privacy/review-queue",
+  requireAuth,
+  requireRole("moderator"),
+  validate({
+    query: z.object({
+      status: z.enum(PRIVACY_STATUSES).optional(),
+      // ambiguous=只有疑难框待裁定的图；manual=检测器不可用需整图人工；all=含已完成
+      scope: z.enum(["ambiguous", "manual", "all"]).default("ambiguous"),
+      page: z.coerce.number().int().min(1).default(1),
+      pageSize: z.coerce.number().int().min(1).max(100).default(20),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const query = req.query as unknown as {
+      status?: string;
+      scope: "ambiguous" | "manual" | "all";
+      page: number;
+      pageSize: number;
+    };
+
+    const where: Record<string, unknown> = {};
+    if (query.status) {
+      where.privacyStatus = query.status;
+    } else if (query.scope === "ambiguous") {
+      where.privacyStatus = { in: ["auto_blurred", "needs_manual", "failed", "processing"] };
+    } else if (query.scope === "manual") {
+      where.privacyStatus = { in: ["needs_manual", "failed", "processing"] };
+    }
+
+    const [items, total, stats] = await Promise.all([
+      prisma.mediaAsset.findMany({
+        where,
+        orderBy: [{ privacyStatus: "asc" }, { id: "desc" }],
+        skip: (query.page - 1) * query.pageSize,
+        take: query.pageSize,
+        select: {
+          uuid: true,
+          privacyStatus: true,
+          width: true,
+          height: true,
+          variantVersion: true,
+          detectionMeta: true,
+          originalPath: true,
+          createdAt: true,
+          owner: { select: { uuid: true, nickname: true } },
+          blurRegions: {
+            orderBy: [{ source: "desc" }, { reviewStatus: "asc" }, { id: "asc" }],
+            select: {
+              id: true, x: true, y: true, w: true, h: true, label: true, confidence: true,
+              detector: true, source: true, reviewStatus: true, ignored: true, ignoreReason: true,
+            },
+          },
+        },
+      }),
+      prisma.mediaAsset.count({ where }),
+      privacyReviewStats(),
+    ]);
+
+    res.json(
+      ok(req, {
+        stats,
+        items: items.map((asset) => ({
+          uuid: asset.uuid,
+          privacyStatus: asset.privacyStatus,
+          width: asset.width,
+          height: asset.height,
+          variantVersion: asset.variantVersion,
+          originalPurged: asset.originalPath === null,
+          createdAt: asset.createdAt,
+          owner: asset.owner,
+          detectionMeta: asset.detectionMeta ?? {},
+          regions: asset.blurRegions,
+          variants: {
+            thumb: `/api/v1/media/${asset.uuid}/thumb?v=${asset.variantVersion}`,
+            grid: `/api/v1/media/${asset.uuid}/grid?v=${asset.variantVersion}`,
+            full: `/api/v1/media/${asset.uuid}/full?v=${asset.variantVersion}`,
+          },
+        })),
+        page: query.page,
+        pageSize: query.pageSize,
+        total,
+      }),
+    );
+  }),
+);
+
+/** 对单条疑难检测框下人工结论：采纳（保留打码）或驳回（确认无需打码+理由） */
+moderationMediaRouter.post(
+  "/media/:assetUuid/regions/:regionId/review",
+  requireAuth,
+  requireRole("moderator"),
+  validate({
+    params: z.object({
+      assetUuid: z.string().uuid("资源标识不正确"),
+      regionId: z.coerce.number().int().positive(),
+    }),
+    body: z.object({
+      accept: z.boolean(),
+      reason: z.string().max(200).optional(),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const result = await reviewRegion(
+      req.params.assetUuid,
+      BigInt(req.params.regionId),
+      { accept: req.body.accept, reason: req.body.reason },
+      req.user!.id,
+    );
+
+    await recordAudit({
+      actorId: req.user!.id,
+      action: AUDIT_ACTIONS.MEDIA_PRIVACY_REVIEW,
+      targetType: "media",
+      targetId: BigInt(req.params.regionId),
+      reason: req.body.reason,
+      after: { accept: req.body.accept, privacyStatus: result.privacyStatus, remaining: result.remaining },
+      req,
+    });
+
+    res.json(ok(req, result));
+  }),
+);
+
+const redetectBodySchema = z.object({
+  assetUuids: z.array(z.string().uuid()).max(2000).optional(),
+  statuses: z.array(z.enum(PRIVACY_STATUSES)).max(20).optional(),
+  since: z.string().datetime().optional(),
+  limit: z.coerce.number().int().min(1).max(2000).optional(),
+});
+
+/**
+ * 批量重跑存量图片的隐私检测（安装/升级适配器后补检历史图片用）。
+ * 仅管理员可触发，参数与结果写入审计日志。
+ */
+moderationMediaRouter.post(
+  "/privacy/redetect",
+  requireAuth,
+  requireRole("admin"),
+  validate({ body: redetectBodySchema }),
+  asyncHandler(async (req, res) => {
+    const body = req.body as z.infer<typeof redetectBodySchema>;
+    const result = await enqueueRedetectBatch({
+      assetUuids: body.assetUuids,
+      statuses: body.statuses as never,
+      since: body.since ? new Date(body.since) : undefined,
+      limit: body.limit,
+    });
+
+    await recordAudit({
+      actorId: req.user!.id,
+      action: AUDIT_ACTIONS.MEDIA_REDETECT_BATCH,
+      targetType: "media",
+      after: toJsonResult(result),
+      req,
+    });
+
+    res.status(202).json(ok(req, result));
+  }),
+);
+
+function toJsonResult(result: unknown) {
+  return JSON.parse(JSON.stringify(result)) as Record<string, unknown>;
+}

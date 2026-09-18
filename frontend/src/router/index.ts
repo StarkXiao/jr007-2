@@ -46,6 +46,12 @@ const router = createRouter({
       meta: { requiresRole: "moderator" },
     },
     {
+      path: "/privacy",
+      name: "privacy-queue",
+      component: () => import("@/pages/PrivacyQueuePage.vue"),
+      meta: { requiresRole: "moderator" },
+    },
+    {
       path: "/reports",
       name: "reports",
       component: () => import("@/pages/ReportsPage.vue"),

@@ -5,6 +5,7 @@ import {
   ERROR_CODES,
   STALE_REPORT_THRESHOLD,
   MAX_BBOX_SPAN_DEG,
+  PUBLISHABLE_PRIVACY_STATUSES,
 } from "../../config/constants";
 import { prisma, toJsonValue } from "../../db/prisma";
 import { AppError } from "../../utils/errors";
@@ -15,6 +16,7 @@ import { boundingBox, fuzzCoordinates, haversineMeters, isValidLatLng, reverseGe
 import { assertAttributesValid, validateAttributes } from "../categories/schemaValidator";
 import { requireCategoryByCode } from "../categories/service";
 import { serializeSpot } from "../shared/serialize";
+import { isPublishableStatus } from "../media/service";
 import type { AuthUser } from "../../types/auth";
 import { isModerator } from "../../types/auth";
 import { notify } from "../../services/notify";
@@ -232,7 +234,7 @@ export async function getSpotByUuid(uuid: string, viewer?: AuthUser) {
   const media = await prisma.mediaAsset.findMany({
     where: {
       spotId: spot.id,
-      ...(privileged ? {} : { privacyStatus: { in: ["auto_clean", "confirmed"] } }),
+      ...(privileged ? {} : { privacyStatus: { in: [...PUBLISHABLE_PRIVACY_STATUSES] } }),
     },
     select: { uuid: true, width: true, height: true, privacyStatus: true, variantVersion: true },
     orderBy: { id: "asc" },
@@ -451,10 +453,8 @@ export async function runAutoCheck(spotId: bigint): Promise<AutoCheckResult> {
     });
   }
 
-  // 3) 隐私门禁：只要有图片未确认，就不能进入发布流程
-  const blockedMedia = spot.media.filter(
-    (asset) => asset.privacyStatus === "needs_manual" || asset.privacyStatus === "failed" || asset.privacyStatus === "processing",
-  );
+  // 3) 隐私门禁：只要有图片未通过隐私门禁（自动放行或人工确认），就不能进入发布流程
+  const blockedMedia = spot.media.filter((asset) => !isPublishableStatus(asset.privacyStatus));
   if (blockedMedia.length > 0) {
     issues.push({
       code: "PRIVACY_NOT_READY",

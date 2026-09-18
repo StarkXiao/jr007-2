@@ -1,5 +1,5 @@
 import type { ReviewStatus } from "@prisma/client";
-import { AUDIT_ACTIONS, ERROR_CODES, REVIEW_REASON_CODES, type ReviewReasonCode } from "../../config/constants";
+import { AUDIT_ACTIONS, ERROR_CODES, PRIVACY_REVIEW_STATUSES, REVIEW_REASON_CODES, type ReviewReasonCode } from "../../config/constants";
 import { prisma } from "../../db/prisma";
 import { AppError } from "../../utils/errors";
 import { fuzzCoordinates, reverseGeocode } from "../../services/geo";
@@ -429,7 +429,7 @@ export async function moderationStats() {
     prisma.reviewTask.count({ where: { status: "appealed" } }),
     prisma.report.count({ where: { status: { in: ["open", "in_review"] } } }),
     prisma.mediaAsset.count({
-      where: { privacyStatus: { in: ["needs_manual", "failed", "processing"] } },
+      where: { privacyStatus: { in: [...PRIVACY_REVIEW_STATUSES] } },
     }),
     prisma.reviewTask.findMany({
       where: { decidedAt: { not: null }, createdAt: { gte: monthStart } },

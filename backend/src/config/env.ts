@@ -72,6 +72,37 @@ const envSchema = z.object({
   ENABLE_FACE_DETECTION: boolFromEnv(false),
   ENABLE_PLATE_DETECTION: boolFromEnv(false),
   FACE_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6),
+
+  // ── 隐私检测：可插拔适配器 ─────────────────────────────────────────────
+  // 已启用的检测器（逗号分隔）。内置 face / plate；http 用于对接外部检测服务；
+  // 外部 npm 包可通过 DETECTION_PLUGINS 加载（路径或包名，需默认导出注册函数）。
+  DETECTION_ADAPTERS: z
+    .string()
+    .optional()
+    .default("")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  DETECTION_PLUGINS: z
+    .string()
+    .optional()
+    .default("")
+    .transform((value) =>
+      value
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean),
+    ),
+  // 外部检测服务（http 适配器）：POST 图片，返回归一化框
+  DETECTOR_HTTP_URL: z.string().optional().default(""),
+  DETECTOR_HTTP_TIMEOUT_MS: intFromEnv(15000, 500, 120000),
+  DETECTOR_HTTP_TOKEN: z.string().optional().default(""),
+  // 置信度自动分级阈值：≥ AUTO_CONFIRM 直接放行，≥ REVIEW 先模糊后人工，更低的丢弃为候选
+  DETECTION_AUTO_CONFIRM_THRESHOLD: z.coerce.number().min(0).max(1).default(0.85),
+  DETECTION_REVIEW_THRESHOLD: z.coerce.number().min(0).max(1).default(0.55),
   DEFAULT_FUZZ_RADIUS_M: intFromEnv(50, 0, 500),
 
   MAP_TILE_URL: z.string().default("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"),
