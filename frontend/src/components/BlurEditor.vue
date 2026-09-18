@@ -38,6 +38,9 @@ watch(
 
 const activeRegions = computed(() => localRegions.value.filter((region) => !region.ignored));
 const autoRegions = computed(() => localRegions.value.filter((region) => region.source === "auto"));
+const reviewRegions = computed(() =>
+  localRegions.value.filter((region) => region.needsReview && !region.ignored),
+);
 const selected = computed(() =>
   selectedIndex.value === null ? null : (localRegions.value[selectedIndex.value] ?? null),
 );
@@ -215,6 +218,9 @@ async function confirmPrivacy() {
       <span class="muted">
         当前 {{ activeRegions.length }} 块打码区域（其中自动检测 {{ autoRegions.length }} 块）
       </span>
+      <el-tag v-if="reviewRegions.length" type="danger" size="small">
+        {{ reviewRegions.length }} 块疑难区域待复核
+      </el-tag>
       <el-tag v-if="selected" type="danger" size="small">已选中第 {{ (selectedIndex ?? 0) + 1 }} 块</el-tag>
     </div>
 
@@ -233,7 +239,8 @@ async function confirmPrivacy() {
         :key="region.id ?? `new-${index}`"
         class="blur-region"
         :class="{
-          'blur-region--auto': region.source === 'auto',
+          'blur-region--auto': region.source === 'auto' && !region.needsReview,
+          'blur-region--review': region.needsReview && !region.ignored,
           'blur-region--ignored': region.ignored,
           'blur-region--selected': selectedIndex === index,
         }"
@@ -243,6 +250,7 @@ async function confirmPrivacy() {
         <span class="blur-region__label">
           {{ region.label === "face" ? "人脸" : region.label === "plate" ? "车牌" : "手动" }}
           <template v-if="region.confidence"> · {{ Math.round(region.confidence * 100) }}%</template>
+          <template v-if="region.needsReview && !region.ignored"> · 待复核</template>
           <template v-if="region.ignored"> · 已忽略</template>
         </span>
       </div>
@@ -263,7 +271,9 @@ async function confirmPrivacy() {
     </div>
 
     <div v-if="autoRegions.length" class="blur-editor__auto">
-      <p class="muted" style="margin: 0 0 6px">自动检测结果（逐条确认是否采纳）</p>
+      <p class="muted" style="margin: 0 0 6px">
+        自动检测结果（逐条确认是否采纳；标红的是置信度不高的疑难区域，请重点核对）
+      </p>
       <div v-for="(region, index) in localRegions" :key="`auto-${index}`">
         <div v-if="region.source === 'auto'" class="blur-editor__auto-row">
           <el-checkbox
@@ -273,6 +283,7 @@ async function confirmPrivacy() {
             {{ region.label === 'face' ? '人脸' : region.label === 'plate' ? '车牌' : '区域' }}
             #{{ index + 1 }}
             <span v-if="region.confidence" class="muted">置信度 {{ Math.round(region.confidence * 100) }}%</span>
+            <el-tag v-if="region.needsReview" type="danger" size="small">疑难</el-tag>
           </el-checkbox>
           <span v-if="region.ignoreReason" class="muted">忽略理由：{{ region.ignoreReason }}</span>
         </div>

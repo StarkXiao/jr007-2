@@ -19,6 +19,45 @@ async function loadDashboard() {
   dashboard.value = await api.get<Record<string, any>>("/admin/dashboard");
 }
 
+const rerunning = ref(false);
+
+/** 批量重跑存量图片的隐私检测（检测器/阈值升级后使用），按 remaining 循环直到跑完全量 */
+async function rerunDetection() {
+  try {
+    await ElMessageBox.confirm(
+      "将对存量图片重新执行隐私检测并按置信度重新分级（人工已确认的图片默认不受影响）。任务在后台异步执行，确定开始？",
+      "批量重跑隐私检测",
+      { confirmButtonText: "开始重跑", cancelButtonText: "取消", type: "warning" },
+    );
+  } catch {
+    return;
+  }
+
+  rerunning.value = true;
+  try {
+    let totalEnqueued = 0;
+    // 单次调用有批量上限，剩余量通过 remaining 返回，循环跑到清空为止
+    for (;;) {
+      const result = await api.post<{ enqueued: number; remaining: number; failed: number }>(
+        "/admin/media/rerun-detection",
+        { limit: 500 },
+      );
+      totalEnqueued += result.enqueued;
+      if (result.failed > 0) {
+        ElMessage.warning(`已入队 ${totalEnqueued} 张，有 ${result.failed} 张入队失败（队列不可用），请稍后重试`);
+        return;
+      }
+      if (result.remaining <= 0) break;
+    }
+    ElMessage.success(`已把 ${totalEnqueued} 张图片加入重跑队列，结果将陆续生效`);
+    await loadDashboard();
+  } catch (error) {
+    ElMessage.error((error as Error).message);
+  } finally {
+    rerunning.value = false;
+  }
+}
+
 async function loadUsers() {
   const result = await api.get<{ items: Array<Record<string, any>> }>("/admin/users", {
     q: userQuery.value.q || undefined,
@@ -188,6 +227,14 @@ onMounted(async () => {
             </el-col>
             <el-col :xs="12" :md="6">
               <el-card shadow="never"><div class="stat"><span>待确认隐私图片</span><strong>{{ dashboard.privacy.pending }}</strong></div></el-card>
+            </el-col>
+            <el-col :xs="12" :md="6">
+              <el-card shadow="never">
+                <div class="stat">
+                  <span>隐私检测</span>
+                  <el-button size="small" :loading="rerunning" @click="rerunDetection">批量重跑存量图片</el-button>
+                </div>
+              </el-card>
             </el-col>
             <el-col :xs="12" :md="6">
               <el-card shadow="never"><div class="stat"><span>平均审核时长</span><strong>{{ dashboard.averageReviewHours }}h</strong></div></el-card>

@@ -29,7 +29,9 @@ const taskId = computed(() => String(route.params.id));
 // 发布门禁：只要还有图片没通过隐私确认，就不能通过审核。
 // 服务端同样会拦一次，这里只是让审核员提前看到原因。
 const blockedMedia = computed(
-  () => task.value?.media.filter((asset) => !["auto_clean", "confirmed"].includes(asset.privacyStatus)) ?? [],
+  () => task.value?.media.filter(
+      (asset) => !["auto_clean", "auto_confirmed", "confirmed"].includes(asset.privacyStatus),
+    ) ?? [],
 );
 const canApprove = computed(() => blockedMedia.value.length === 0);
 
@@ -267,7 +269,7 @@ onMounted(load);
               <div v-if="currentMedia" style="margin-bottom: 8px">
                 <el-tag
                   size="small"
-                  :type="['auto_clean', 'confirmed'].includes(currentMedia.privacyStatus) ? 'success' : 'warning'"
+                  :type="['auto_clean', 'auto_confirmed', 'confirmed'].includes(currentMedia.privacyStatus) ? 'success' : 'warning'"
                 >
                   {{ currentMedia.privacyStatus }}
                 </el-tag>

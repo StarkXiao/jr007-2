@@ -4,7 +4,7 @@ import {
   PUBLISHABLE_PRIVACY_STATUSES,
   SIGNED_URL_TTL_MS,
 } from "../../config/constants";
-import { prisma, toJsonValue } from "../../db/prisma";
+import { prisma, toJsonValue, Prisma } from "../../db/prisma";
 import { AppError } from "../../utils/errors";
 import { getStorage } from "../../services/storage";
 import {
@@ -13,7 +13,7 @@ import {
   processImage,
   type BlurRegionInput,
 } from "../../services/imaging";
-import { detectSensitiveRegions } from "../../services/detection";
+import { detectSensitiveRegions, type DetectionResult } from "../../services/detection";
 import { enqueueImageJob } from "../../services/queue";
 import { logger } from "../../utils/logger";
 import { isModerator } from "../../types/auth";
@@ -127,7 +127,31 @@ function buildVariantMap(uuid: string, version: number): Record<string, string> 
 export interface ProcessOutcome {
   privacyStatus: PrivacyStatus;
   autoDetected: number;
+  /** 其中被标记为疑难、需要人工复核的区域数 */
+  needsReview: number;
   notes: string[];
+}
+
+export type ProcessReason = "upload" | "blur-update" | "retry" | "privacy-reset" | "rerun";
+
+/**
+ * 根据检测结果与人工框决定图片的隐私状态（纯函数，状态机的核心）。
+ *
+ * 分级规则：
+ * - 有疑难区域（中置信度）→ needs_manual，人工只需复核这些区域
+ * - 有检测框且全部高置信度 → auto_confirmed，系统自动放行
+ * - 无检测框但检测器可用 → 干净（有人工框时保持 manual_blurred）
+ * - 检测器全部不可用 → needs_manual，这是不可跳过的门禁
+ */
+export function decidePrivacyStatus(
+  detection: Pick<DetectionResult, "anyAvailable" | "boxes">,
+  activeManualRegions: number,
+): PrivacyStatus {
+  if (detection.boxes.length > 0) {
+    return detection.boxes.some((box) => box.grade === "review") ? "needs_manual" : "auto_confirmed";
+  }
+  if (!detection.anyAvailable) return "needs_manual";
+  return activeManualRegions > 0 ? "manual_blurred" : "auto_clean";
 }
 
 /**
@@ -135,10 +159,13 @@ export interface ProcessOutcome {
  *
  * 顺序不可调换：读原图 → 检测 → 落模糊区域 → 渲染变体 → 更新状态。
  * 每一步都从**原图**重新渲染，避免重复编辑导致模糊区域叠加失真。
+ *
+ * rerun 与 retry 的区别：retry 是失败后的重试（累计 retryCount），
+ * rerun 是检测器/阈值升级后对存量图片的批量重跑，不算失败重试。
  */
 export async function processAsset(
   assetUuid: string,
-  reason: "upload" | "blur-update" | "retry" | "privacy-reset",
+  reason: ProcessReason,
 ): Promise<ProcessOutcome> {
   const asset = await prisma.mediaAsset.findUnique({ where: { uuid: assetUuid } });
   if (!asset) throw AppError.notFound("图片不存在");
@@ -155,19 +182,26 @@ export async function processAsset(
 
   let privacyStatus: PrivacyStatus;
   let autoDetected = 0;
+  let needsReview = 0;
   const notes: string[] = [];
+  let detectionReport: Record<string, unknown> = {};
 
-  if (reason === "upload" || reason === "retry") {
+  if (reason === "upload" || reason === "retry" || reason === "rerun") {
     const detection = await detectSensitiveRegions(result.variants.full.buffer);
     notes.push(...detection.notes);
+    detectionReport = {
+      detectors: detection.detectors,
+      droppedLowConfidence: detection.droppedCount,
+    };
+
+    // 无论本次检测结果如何，都先清掉旧的自动区域再写入新结果：
+    // 重跑后检测器可能不再报某些区域，旧框若残留会永远跟着图片。
+    // 人工框选的区域不在清除范围内。
+    await prisma.blurRegion.deleteMany({
+      where: { assetId: asset.id, source: "auto" },
+    });
 
     if (detection.boxes.length > 0) {
-      // 重复处理同一张图（例如入队后又走了同步降级）时，
-      // 先把上一次自动生成的区域清掉，否则会不断叠加出重复的打码块。
-      await prisma.blurRegion.deleteMany({
-        where: { assetId: asset.id, source: "auto" },
-      });
-
       await prisma.blurRegion.createMany({
         data: detection.boxes.map((box) => ({
           assetId: asset.id,
@@ -179,10 +213,12 @@ export async function processAsset(
           h: box.h,
           label: box.label,
           confidence: box.confidence,
+          needsReview: box.grade === "review",
           strength: 14,
         })),
       });
       autoDetected = detection.boxes.length;
+      needsReview = detection.boxes.filter((box) => box.grade === "review").length;
 
       // 自动检测到区域后需要按新区域重新渲染一次，确保公开版本确实被模糊
       const regions = await prisma.blurRegion.findMany({
@@ -190,14 +226,10 @@ export async function processAsset(
       });
       const rendered = await processImage(original, regions.map(toBlurInput));
       await writeVariants(assetUuid, asset.variantVersion + 2, rendered.variants);
-      privacyStatus = "auto_blurred";
-    } else if (detection.anyAvailable) {
-      // 检测器可用且未发现敏感区域，才算真正干净
-      privacyStatus = "auto_clean";
-    } else {
-      // 没有检测能力时必须人工确认，这是不可跳过的门禁
-      privacyStatus = "needs_manual";
     }
+
+    const manualCount = activeRegions.filter((region) => region.source === "manual").length;
+    privacyStatus = decidePrivacyStatus(detection, manualCount);
   } else {
     const manualCount = existingRegions.filter((region) => region.source === "manual").length;
     privacyStatus = manualCount > 0 ? "manual_blurred" : "auto_blurred";
@@ -208,14 +240,21 @@ export async function processAsset(
     data: {
       privacyStatus,
       exifStripped: true,
-      detectionMeta: toJsonValue({ notes, autoDetected, processedAt: new Date().toISOString() }),
+      detectionMeta: toJsonValue({
+        notes,
+        autoDetected,
+        needsReview,
+        ...detectionReport,
+        reason,
+        processedAt: new Date().toISOString(),
+      }),
       retryCount: reason === "retry" ? { increment: 1 } : undefined,
       width: result.width,
       height: result.height,
     },
   });
 
-  return { privacyStatus, autoDetected, notes };
+  return { privacyStatus, autoDetected, needsReview, notes };
 }
 
 function toBlurInput(region: {
@@ -344,6 +383,8 @@ export async function updateBlurRegions(
             ignoreReason: region.ignoreReason ?? null,
             algorithm: region.algorithm ?? undefined,
             strength: region.strength ?? undefined,
+            // 审核员提交修改意味着这些区域已经过人眼，疑难标记随之清除
+            needsReview: false,
           },
         });
         continue;
@@ -396,6 +437,78 @@ export async function retryProcessing(assetUuid: string): Promise<ProcessOutcome
   if (!asset) throw AppError.notFound("图片不存在");
   if (!asset.originalPath) throw AppError.badRequest("原图已清理，无法重试");
   return processAsset(assetUuid, "retry");
+}
+
+/**
+ * 批量重跑的默认状态范围：只动"机器处理过"的图片。
+ * manual_blurred 与 confirmed 是人工成果，默认不重跑，
+ * 确需覆盖时（例如检测器重大升级）必须显式指定。
+ */
+export const RERUNNABLE_DEFAULT_STATUSES: PrivacyStatus[] = [
+  "processing",
+  "failed",
+  "needs_manual",
+  "auto_clean",
+  "auto_blurred",
+  "auto_confirmed",
+];
+
+export const RERUN_BATCH_LIMIT = 500;
+
+export interface RerunOptions {
+  statuses?: PrivacyStatus[];
+  limit?: number;
+}
+
+export interface RerunResult {
+  /** 本次成功入队的数量 */
+  enqueued: number;
+  /** 入队失败的数量（队列不可用时） */
+  failed: number;
+  /** 符合筛选条件但尚未入队的剩余数量，调用方可据此决定是否继续 */
+  remaining: number;
+}
+
+/** 抽出为纯函数，便于单测覆盖筛选条件 */
+export function buildRerunWhere(statuses?: PrivacyStatus[]): Prisma.MediaAssetWhereInput {
+  return {
+    // 原图已按保留策略清理的图片无法重跑
+    originalPath: { not: null },
+    privacyStatus: { in: statuses && statuses.length > 0 ? statuses : RERUNNABLE_DEFAULT_STATUSES },
+  };
+}
+
+/**
+ * 批量重跑存量图片的隐私检测。
+ *
+ * 场景：检测器升级、阈值调整或新增适配器后，让存量图片按新能力重新分级。
+ * 逐张入队由 worker 异步执行，接口本身只负责筛选与投递，
+ * 因此单次调用有上限——剩余数量通过返回值暴露，可循环调用直到 remaining 为 0。
+ */
+export async function rerunDetectionBatch(options: RerunOptions = {}): Promise<RerunResult> {
+  const limit = Math.min(Math.max(options.limit ?? 100, 1), RERUN_BATCH_LIMIT);
+  const where = buildRerunWhere(options.statuses);
+
+  const [assets, total] = await Promise.all([
+    prisma.mediaAsset.findMany({
+      where,
+      select: { uuid: true },
+      orderBy: { createdAt: "asc" },
+      take: limit,
+    }),
+    prisma.mediaAsset.count({ where }),
+  ]);
+
+  let enqueued = 0;
+  let failed = 0;
+  for (const asset of assets) {
+    // 批量场景不做同步降级：队列不可用时宁可本次少跑，也不能把 API 进程拖进图片处理
+    const ok = await enqueueImageJob({ assetUuid: asset.uuid, reason: "rerun" });
+    if (ok) enqueued += 1;
+    else failed += 1;
+  }
+
+  return { enqueued, failed, remaining: total - enqueued - failed };
 }
 
 /** 隐私举报成立：删除公开变体并重置隐私状态，公开地址立即失效 */

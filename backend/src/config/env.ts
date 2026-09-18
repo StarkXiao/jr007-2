@@ -72,6 +72,9 @@ const envSchema = z.object({
   ENABLE_FACE_DETECTION: boolFromEnv(false),
   ENABLE_PLATE_DETECTION: boolFromEnv(false),
   FACE_CONFIDENCE_THRESHOLD: z.coerce.number().min(0).max(1).default(0.6),
+  // 置信度分级阈值：≥ AUTO 自动打码放行；≥ REVIEW 打码但转人工复核；低于 REVIEW 视为误报丢弃
+  DETECTION_AUTO_THRESHOLD: z.coerce.number().min(0).max(1).default(0.85),
+  DETECTION_REVIEW_THRESHOLD: z.coerce.number().min(0).max(1).default(0.45),
   DEFAULT_FUZZ_RADIUS_M: intFromEnv(50, 0, 500),
 
   MAP_TILE_URL: z.string().default("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"),
@@ -108,6 +111,14 @@ function loadEnv(): AppEnv {
     // 配置不合法时拒绝启动，避免带着错误配置上线
     throw new Error(`环境变量校验失败，请检查 .env：\n${issues}`);
   }
+
+  // 复核阈值高于自动阈值时，所有检测框都会被丢弃，隐私检测形同虚设——必须拒绝启动
+  if (parsed.data.DETECTION_REVIEW_THRESHOLD > parsed.data.DETECTION_AUTO_THRESHOLD) {
+    throw new Error(
+      "环境变量校验失败：DETECTION_REVIEW_THRESHOLD 不能大于 DETECTION_AUTO_THRESHOLD",
+    );
+  }
+
   return parsed.data;
 }
 

@@ -6,8 +6,8 @@ import { logger } from "../../utils/logger";
 
 export interface ImageJobData {
   assetUuid: string;
-  /** 重新渲染时标记，用于审计与日志区分 */
-  reason: "upload" | "blur-update" | "retry";
+  /** 重新渲染时标记，用于审计与日志区分；rerun 表示检测能力升级后的存量重跑 */
+  reason: "upload" | "blur-update" | "retry" | "rerun";
 }
 
 export interface SweepJobData {

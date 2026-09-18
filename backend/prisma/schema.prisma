@@ -55,6 +55,8 @@ enum PrivacyStatus {
   processing
   auto_clean
   auto_blurred
+  // 高置信度自动打码完成，系统直接放行，无需人工复核
+  auto_confirmed
   needs_manual
   manual_blurred
   confirmed
@@ -301,6 +303,8 @@ model BlurRegion {
   strength     Int           @default(12) @db.SmallInt
   label        String?       @db.VarChar(32)
   confidence   Float?
+  // 疑难区域标记：置信度落在复核区间时置 true，审核员只需复核这些区域
+  needsReview  Boolean       @default(false) @map("needs_review")
   ignored      Boolean       @default(false)
   ignoreReason String?       @map("ignore_reason")
   createdBy    BigInt?       @map("created_by")
@@ -310,6 +314,7 @@ model BlurRegion {
   creator User?      @relation(fields: [createdBy], references: [id])
 
   @@index([assetId, ignored], map: "idx_blur_asset")
+  @@index([needsReview], map: "idx_blur_needs_review")
   @@map("blur_regions")
 }
 

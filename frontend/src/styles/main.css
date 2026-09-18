@@ -345,6 +345,14 @@ a:hover {
   background: rgba(230, 126, 34, 0.16);
 }
 
+/* 疑难区域：中置信度，需要人工复核确认，用更醒目的样式区分 */
+.blur-region--review {
+  border-style: dashed;
+  border-color: var(--color-danger);
+  background: rgba(231, 76, 60, 0.22);
+  box-shadow: 0 0 0 2px rgba(231, 76, 60, 0.25);
+}
+
 .blur-region--ignored {
   border-style: dotted;
   border-color: #9ca3af;

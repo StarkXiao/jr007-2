@@ -32,6 +32,7 @@ const STATUS_TEXT: Record<string, string> = {
   processing: "隐私处理中…",
   auto_clean: "未发现敏感区域，待审核确认",
   auto_blurred: "已自动模糊，待审核确认",
+  auto_confirmed: "已自动模糊并放行",
   needs_manual: "需要人工确认隐私区域",
   manual_blurred: "已人工模糊，待确认",
   confirmed: "隐私处理已确认",

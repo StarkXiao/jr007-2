@@ -73,10 +73,12 @@ worker 不监听端口，因此它用 Redis 心跳探活（`node dist/scripts/wo
 
 1. **上传即清除元数据。** EXIF、GPS、ICC、XMP 全部丢弃，并按 EXIF 方向摆正。这一步不可跳过，失败则整张图拒绝入库。
 2. **图片默认不可公开访问。** 原图存私有目录，公开变体只有通过隐私确认后才会以可缓存的形式对外提供。
-3. **发布门禁。** `privacy_status` 不是 `auto_clean` 或 `confirmed` 时，审核接口一律返回 422；改判申诉也不能绕过这道闸门。
+3. **发布门禁。** `privacy_status` 不是 `auto_clean`、`auto_confirmed` 或 `confirmed` 时，审核接口一律返回 422；改判申诉也不能绕过这道闸门。
 4. **位置模糊化。** 对外只返回加了确定性偏移的坐标，偏移量由条目 UUID 派生，所以同一个地点每次显示位置一致，图上不会乱跳。
 
 人脸与车牌检测是**可选增强项**（`ENABLE_FACE_DETECTION` / `ENABLE_PLATE_DETECTION`，默认关闭，需要自行安装依赖与模型）。关闭时系统走人工框选 + 必须确认的路径，隐私门禁强度不变。
+
+检测能力做成了**可插拔适配器**：新检测器实现 `PrivacyDetector` 接口注册一行即可接入。检测结果按置信度自动分级——高置信度自动打码并直接放行（`auto_confirmed`），中置信度的疑难区域打码后转人工复核（`needs_manual`），低置信度按误报丢弃。检测器或阈值升级后，管理端可一键批量重跑存量图片（`POST /admin/media/rerun-detection`）。
 
 ## 目录
 

@@ -51,6 +51,7 @@ async function bootstrap(): Promise<void> {
           assetUuid: job.data.assetUuid,
           status: outcome.privacyStatus,
           autoDetected: outcome.autoDetected,
+          needsReview: outcome.needsReview,
         },
         "图片处理完成",
       );

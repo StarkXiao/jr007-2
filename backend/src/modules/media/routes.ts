@@ -98,7 +98,7 @@ mediaRouter.get(
         detectionMeta: true,
         blurRegions: {
           where: { ignored: false },
-          select: { id: true, source: true, algorithm: true, x: true, y: true, w: true, h: true, strength: true, label: true, confidence: true, ignored: true, ignoreReason: true },
+          select: { id: true, source: true, algorithm: true, x: true, y: true, w: true, h: true, strength: true, label: true, confidence: true, needsReview: true, ignored: true, ignoreReason: true },
         },
       },
     });
@@ -196,6 +196,90 @@ mediaRouter.get(
 );
 
 // ---------------------------------------------------------------- 审核侧
+
+/**
+ * 疑难区域复核队列。
+ *
+ * 只列需要人工介入的图片（needs_manual）：可能是检测器不可用，
+ * 也可能是存在中置信度的疑难区域。审核员只需处理这些图片，
+ * 高置信度自动打码的图片（auto_confirmed）已由系统直接放行。
+ */
+moderationMediaRouter.get(
+  "/media/review-queue",
+  requireAuth,
+  requireRole("moderator"),
+  validate({
+    query: z.object({
+      page: z.coerce.number().int().min(1).default(1),
+      pageSize: z.coerce.number().int().min(1).max(50).default(20),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const query = req.query as unknown as { page: number; pageSize: number };
+
+    const where = { privacyStatus: "needs_manual" as const };
+    const [items, total] = await Promise.all([
+      prisma.mediaAsset.findMany({
+        where,
+        orderBy: { createdAt: "asc" },
+        skip: (query.page - 1) * query.pageSize,
+        take: query.pageSize,
+        select: {
+          uuid: true,
+          privacyStatus: true,
+          width: true,
+          height: true,
+          variantVersion: true,
+          createdAt: true,
+          detectionMeta: true,
+          owner: { select: { nickname: true } },
+          blurRegions: {
+            where: { ignored: false },
+            select: {
+              id: true,
+              source: true,
+              x: true,
+              y: true,
+              w: true,
+              h: true,
+              label: true,
+              confidence: true,
+              needsReview: true,
+            },
+          },
+        },
+      }),
+      prisma.mediaAsset.count({ where }),
+    ]);
+
+    res.json(
+      ok(req, {
+        items: items.map((asset) => {
+          const reviewRegions = asset.blurRegions.filter((region) => region.needsReview);
+          return {
+            uuid: asset.uuid,
+            privacyStatus: asset.privacyStatus,
+            width: asset.width,
+            height: asset.height,
+            createdAt: asset.createdAt,
+            owner: asset.owner.nickname,
+            detectionMeta: asset.detectionMeta ?? {},
+            // 审核员只需要看疑难区域；高置信度区域已自动打码，列个数量即可
+            reviewRegions,
+            autoRegionCount: asset.blurRegions.length - reviewRegions.length,
+            variants: {
+              grid: `/api/v1/media/${asset.uuid}/grid?v=${asset.variantVersion}`,
+              full: `/api/v1/media/${asset.uuid}/full?v=${asset.variantVersion}`,
+            },
+          };
+        }),
+        page: query.page,
+        pageSize: query.pageSize,
+        total,
+      }),
+    );
+  }),
+);
 
 const blurRegionSchema = z.object({
   regions: z

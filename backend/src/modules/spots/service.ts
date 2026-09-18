@@ -5,6 +5,7 @@ import {
   ERROR_CODES,
   STALE_REPORT_THRESHOLD,
   MAX_BBOX_SPAN_DEG,
+  PUBLISHABLE_PRIVACY_STATUSES,
 } from "../../config/constants";
 import { prisma, toJsonValue } from "../../db/prisma";
 import { AppError } from "../../utils/errors";
@@ -232,7 +233,8 @@ export async function getSpotByUuid(uuid: string, viewer?: AuthUser) {
   const media = await prisma.mediaAsset.findMany({
     where: {
       spotId: spot.id,
-      ...(privileged ? {} : { privacyStatus: { in: ["auto_clean", "confirmed"] } }),
+      // 与发布门禁共用同一份状态清单，避免两处定义漂移
+      ...(privileged ? {} : { privacyStatus: { in: [...PUBLISHABLE_PRIVACY_STATUSES] } }),
     },
     select: { uuid: true, width: true, height: true, privacyStatus: true, variantVersion: true },
     orderBy: { id: "asc" },

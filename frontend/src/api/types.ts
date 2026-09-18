@@ -146,6 +146,8 @@ export interface BlurRegion {
   h?: number;
   label?: string | null;
   confidence?: number | null;
+  /** 疑难区域标记：中置信度区域需要人工复核确认 */
+  needsReview?: boolean;
   ignored?: boolean;
   ignoreReason?: string | null;
 }

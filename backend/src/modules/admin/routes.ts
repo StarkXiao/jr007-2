@@ -11,6 +11,8 @@ import { AUDIT_ACTIONS } from "../../config/constants";
 import { recordAudit } from "../../services/audit";
 import { notify } from "../../services/notify";
 import { moderationStats } from "../reviews/decisions";
+import { rerunDetectionBatch, RERUN_BATCH_LIMIT } from "../media/service";
+import { listDetectors } from "../../services/detection";
 
 export const adminRouter = Router();
 
@@ -409,5 +411,61 @@ adminRouter.get(
   asyncHandler(async (req, res) => {
     const { filterStats } = await import("../../services/moderation/contentFilter");
     res.json(ok(req, toJsonValue({ ...filterStats })));
+  }),
+);
+
+const PRIVACY_STATUSES = [
+  "processing",
+  "auto_clean",
+  "auto_blurred",
+  "auto_confirmed",
+  "needs_manual",
+  "manual_blurred",
+  "confirmed",
+  "failed",
+] as const;
+
+/**
+ * 批量重跑存量图片的隐私检测。
+ *
+ * 典型场景：启用了新检测器、升级了模型或调整了置信度阈值后，
+ * 让存量图片按新能力重新分级。任务逐张入队由 worker 异步执行；
+ * 单次有上限，按返回值里的 remaining 循环调用即可跑完全量。
+ */
+adminRouter.post(
+  "/admin/media/rerun-detection",
+  validate({
+    body: z.object({
+      statuses: z.array(z.enum(PRIVACY_STATUSES)).max(PRIVACY_STATUSES.length).optional(),
+      limit: z.coerce.number().int().min(1).max(RERUN_BATCH_LIMIT).default(100),
+    }),
+  }),
+  asyncHandler(async (req, res) => {
+    const result = await rerunDetectionBatch({
+      statuses: req.body.statuses,
+      limit: req.body.limit,
+    });
+
+    await recordAudit({
+      actorId: req.user!.id,
+      action: AUDIT_ACTIONS.MEDIA_DETECTION_RERUN,
+      targetType: "media",
+      after: {
+        statuses: req.body.statuses ?? "default",
+        limit: req.body.limit,
+        ...result,
+      },
+      req,
+    });
+
+    res.json(
+      ok(req, {
+        ...result,
+        detectors: listDetectors().map((detector) => ({
+          name: detector.name,
+          enabled: detector.isEnabled(),
+        })),
+      }),
+    );
   }),
 );

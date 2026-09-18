@@ -74,8 +74,12 @@ export type NotificationType = keyof typeof NOTIFICATION_TYPES;
 /**
  * 允许发布到地图的隐私状态。
  * 全项目只有这一处定义，审核门禁、图片读取、前端提示都从这里取。
+ *
+ * auto_confirmed 的含义：所有检测框都是高置信度，系统已自动打码。
+ * 打码策略本来就是"宁滥勿缺"，误检的代价是图片局部被糊（体验问题），
+ * 不会造成隐私泄露——因此高置信度结果可以直接放行，把人工留给疑难区域。
  */
-export const PUBLISHABLE_PRIVACY_STATUSES = ["auto_clean", "confirmed"] as const;
+export const PUBLISHABLE_PRIVACY_STATUSES = ["auto_clean", "auto_confirmed", "confirmed"] as const;
 
 export type PublishablePrivacyStatus = (typeof PUBLISHABLE_PRIVACY_STATUSES)[number];
 
@@ -100,6 +104,7 @@ export const AUDIT_ACTIONS = {
   REVIEW_APPEAL_DECIDE: "review.appeal.decide",
   MEDIA_BLUR_UPDATE: "media.blur.update",
   MEDIA_PRIVACY_CONFIRM: "media.privacy.confirm",
+  MEDIA_DETECTION_RERUN: "media.detection.rerun",
   MEDIA_ORIGINAL_VIEW: "media.original.view",
   USER_BAN: "user.ban",
   USER_UNBAN: "user.unban",
